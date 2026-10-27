@@ -1,0 +1,413 @@
+-- SETTINGS
+
+local PACK_URL = "https://raw.githubusercontent.com/itzsum1tblox/Rivals-minecraft-texture-itzsum1tblox-/main/Minecraft_Classic_Pack_v1.2%28day%29.json"
+local PATTERN_ID = "136887158756561" -- the game's map pattern
+local TILE_STUDS = 4                 -- size of one block in studs (lower = smaller blocks)
+local AUTO_PATTERN = false           -- finds the game's other map patterns (fixes half map)
+local AUTO_MIN_COUNT = 25
+local FALLBACK_PARTS = false         -- covers surfaces that are still bare
+local HIDE_OTHER_TEXTURES = false
+local MIN_SIZE = 4
+local MIN_FACE = 2
+local MAX_PARTS = 20000
+local TINT = Color3.fromRGB(175, 175, 175) -- brightness of blocks (lower = darker, fixes washed-out walls)
+
+-- LOADING SCREEN / LOGO
+local LOGO_MODE = "custom"           -- "custom" = your logo.png, "original" = game's logo, "remove" = hide it
+local LOGO_URL = "https://raw.githubusercontent.com/itzsum1tblox/Rivals-minecraft-texture-itzsum1tblox-/main/logo.png"
+local TEXT_SWAP = true               -- changes any text saying "66mods" into NAME_TEXT
+local NAME_TEXT = "itzsum1tblox"
+
+-- Folders directly under Workspace that should NOT get blocks (the lobby)
+local EXCLUDE_NAMES = {"Lobby", "LobbyMap", "Hub", "Spawn"}
+
+local function log(m) print("[MC] " .. tostring(m)) end
+
+local EXCLUDE = {}
+for _, n in ipairs(EXCLUDE_NAMES) do EXCLUDE[n:lower()] = true end
+
+local function topOf(inst)
+local top = inst
+while top.Parent and top.Parent ~= workspace do top = top.Parent end
+return top
+end
+
+local function excluded(inst)
+if not inst:IsDescendantOf(workspace) then return false end
+return EXCLUDE[topOf(inst).Name:lower()] == true
+end
+
+-- face sizes + square tiles that line up with a part's edges (used for bare surfaces)
+local function faceSize(part, face)
+local s = part.Size
+if face == Enum.NormalId.Top then
+if part:IsA("WedgePart") then
+return s.X, math.sqrt(s.Y * s.Y + s.Z * s.Z)
+end
+return s.X, s.Z
+elseif face == Enum.NormalId.Bottom then
+return s.X, s.Z
+elseif face == Enum.NormalId.Front or face == Enum.NormalId.Back then
+return s.X, s.Y
+end
+return s.Z, s.Y
+end
+
+local function plainEnough(part)
+if part.ClassName == "WedgePart" then return true end
+return part.ClassName == "Part" and part.Shape == Enum.PartType.Block
+end
+
+local function fitScale(part, face)
+local a, b = faceSize(part, face)
+local s = math.max(1, math.min(TILE_STUDS, a, b))
+local nu = math.max(1, math.floor(a / s + 0.5))
+local nv = math.max(1, math.floor(b / s + 0.5))
+return a / nu, b / nv
+end
+
+
+---
+
+-- BLOCK TILE (built in, no download needed)
+
+local B64 = "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAB6ElEQVR42u2ZQW7CMBBFSQgcjFVvyBFY9UhlUUQPQQJ01egt/ISRQ6tKf1YWcrBHen/8x+4Oh/fVT9xut3m8Xq/n8fV6ncfDMMzj+/0+j7uuK/7O4O/TNM3j7XZbXIt72O/3xT30q38eSeCvYyCL5/NXkde+74usk9FxHB/O51rkmNxz3dPps7hpajUIJYFWDZBXBmszg7yS+81mU5x/uVyKemBQS3ZW2B6CUBJo1YB5G+ObNdjCzgTjmBrgfO6NQS0FoSTQqgHz9GSR9dg8Epm2HsB6BtOV+a4glASW1ABrNjkz36K+XHoA1nJqyWq/eS3rs4NQEmjVAH2O9aZklNzbt9bv8lvOoWZsHC+UBF6lAfMndjdK7q2uW/1mn13TMxj3uRdKAktqwPyM+W+ya7Xc7oioGdMS92P3qjkHksBvaIC/W19rvazddXK+nSE1/TT1E4SSwJIaqHnPYtAjPfutac96a7u3DUJJYMme2OpulScRT2/vXFyXTNvbnL0bBKEk0KoBMmp3O+aLau5Sa3wU+aYeau6aglASaNUAuTwePx56EuPVegCr5TWeyt7p0hMngQWj2+3enqr3HHN+zRnCd+3t2da194oglARazwHzM3ZHZPeY5uONe+Obe7A+gf8ThJJAY3wDWTNIPI6LFaYAAAAASUVORK5CYII="
+
+local function decode(s)
+local chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+local map = {}
+for i = 1, 64 do map[chars:sub(i, i)] = i - 1 end
+local out, acc, bits = {}, 0, 0
+for c in s:gmatch("[A-Za-z0-9+/]") do
+acc = acc * 64 + map[c]
+bits = bits + 6
+if bits >= 8 then
+bits = bits - 8
+local d = 2 ^ bits
+local byte = math.floor(acc / d)
+acc = acc - byte * d
+out[#out + 1] = string.char(byte)
+end
+end
+return table.concat(out)
+end
+
+local TILE
+do
+local ok, err = pcall(function()
+writefile("mc_tile_v2.png", decode(B64))
+TILE = getcustomasset("mc_tile_v2.png")
+end)
+if not ok or not TILE then
+warn("[MC] Tile failed: " .. tostring(err))
+return
+end
+end
+
+
+---
+
+-- PACK (sounds, icons, skies) + MAP PATTERN -> BLOCKS
+
+local Players = game:GetService("Players")
+local stats, swaps, done = {}, 0, {}
+local fallbackParts = 0
+local resolved = {}
+
+local function dedupe(parent, face)
+if not parent then return end
+for _, c in ipairs(parent:GetChildren()) do
+if c.Name == "_McBlock" and c:IsA("Decal") and c.Face == face then
+c:Destroy()
+end
+end
+end
+
+local function applyTile(inst, p)
+stats[inst.ClassName] = (stats[inst.ClassName] or 0) + 1
+if inst:IsA("Texture") then
+inst.Texture = TILE
+inst.StudsPerTileU = TILE_STUDS
+inst.StudsPerTileV = TILE_STUDS
+inst.Transparency = 0
+inst.Color3 = TINT
+dedupe(inst.Parent, inst.Face)
+elseif inst:IsA("Decal") then
+if done[inst] then return end
+done[inst] = true
+local t = Instance.new("Texture")
+t.Name = "_McTile"
+t.Face = inst.Face
+t.Texture = TILE
+t.StudsPerTileU = TILE_STUDS
+t.StudsPerTileV = TILE_STUDS
+t.Color3 = TINT
+t.Parent = inst.Parent
+inst.Transparency = 1
+dedupe(inst.Parent, inst.Face)
+else
+inst[p] = TILE
+end
+end
+
+local function report()
+local list = {}
+for k, v in pairs(stats) do list[#list + 1] = k .. "=" .. v end
+log("swaps=" .. swaps .. " | map pattern replaced: " .. (#list > 0 and table.concat(list, ", ") or "none yet") .. " | extra parts: " .. fallbackParts)
+end
+
+local PROPS = {
+Sound = {"SoundId"},
+ImageLabel = {"Image"},
+ImageButton = {"Image", "HoverImage", "PressedImage"},
+Decal = {"Texture"},
+Texture = {"Texture"},
+ParticleEmitter = {"Texture"},
+Beam = {"Texture"},
+Trail = {"Texture"},
+MeshPart = {"TextureID"},
+SpecialMesh = {"TextureId"},
+Sky = {"SkyboxBk", "SkyboxDn", "SkyboxFt", "SkyboxLf", "SkyboxRt", "SkyboxUp"},
+}
+
+local function trySwap(inst, p)
+local ok3, v = pcall(function() return inst[p] end)
+if not ok3 or type(v) ~= "string" or v:find("^rbxasset://") then return end
+local id = v:match("rbxassetid://(%d+)") or v:match("[?&]id=(%d+)")
+local new = id and resolved[id]
+if new == nil then return end
+if new == TILE and excluded(inst) then return end
+swaps = swaps + 1
+if new == TILE then
+pcall(applyTile, inst, p)
+else
+pcall(function() inst[p] = new end)
+end
+end
+
+-- changes "66mods" text (any capitalization) into NAME_TEXT
+local function fixText(inst)
+if not (inst:IsA("TextLabel") or inst:IsA("TextButton")) then return end
+local function fix()
+local ok4, t = pcall(function() return inst.Text end)
+if ok4 and type(t) == "string" and t ~= "" then
+local new, n = string.gsub(t, "66%s*[Mm][Oo][Dd][Ss]", NAME_TEXT)
+if n > 0 then pcall(function() inst.Text = new end) end
+end
+end
+fix()
+inst:GetPropertyChangedSignal("Text"):Connect(fix)
+end
+
+local function handle(inst)
+if TEXT_SWAP then fixText(inst) end
+local props = PROPS[inst.ClassName]
+if not props then return end
+for _, p in ipairs(props) do
+trySwap(inst, p)
+inst:GetPropertyChangedSignal(p):Connect(function() trySwap(inst, p) end)
+end
+end
+
+local ok, err = pcall(function()
+local rules = game:GetService("HttpService"):JSONDecode(game:HttpGet(PACK_URL)).replacement_rules
+local cache = {}
+
+local function getAsset(url)
+if cache[url] then return cache[url] end
+local name = "mcpack_" .. url:match("([^/]+)$")
+if not isfile(name) then writefile(name, game:HttpGet(url)) end
+cache[url] = getcustomasset(name)
+return cache[url]
+end
+
+local good, bad = 0, 0
+for _, r in ipairs(rules) do
+if r.enabled then
+local value
+if r.mode == "id" then
+value = ""
+elseif r.cdn_url and not r.cdn_url:match("%.obj$") then
+local ok2, res = pcall(getAsset, r.cdn_url)
+if ok2 and res then
+value = res
+good = good + 1
+else
+bad = bad + 1
+warn("[MC] Failed: " .. tostring(r.name))
+end
+end
+if value ~= nil then
+for _, id in ipairs(r.replace_ids) do
+resolved[string.format("%.0f", id)] = value -- full digits, no e+14
+end
+end
+end
+end
+resolved[PATTERN_ID] = TILE -- map pattern becomes blocks
+log("files ok=" .. good .. " failed=" .. bad)
+
+-- LOADING SCREEN / LOGO (the 66mods logo images from the pack)
+local LOGO_IDS = {"17803962335", "13854780213", "13854780042"}
+if LOGO_MODE == "original" then
+for _, id in ipairs(LOGO_IDS) do resolved[id] = nil end
+elseif LOGO_MODE == "remove" then
+for _, id in ipairs(LOGO_IDS) do resolved[id] = "" end
+elseif LOGO_MODE == "custom" then
+local okL, asset = pcall(getAsset, LOGO_URL)
+if okL and asset then
+resolved["17803962335"] = asset
+resolved["13854780213"] = asset
+resolved["13854780042"] = ""
+log("custom logo loaded")
+else
+warn("[MC] logo download failed - upload logo.png to your repo")
+end
+end
+
+for _, inst in ipairs(game:GetDescendants()) do
+task.spawn(handle, inst)
+end
+game.DescendantAdded:Connect(function(inst)
+task.defer(handle, inst)
+end)
+
+end)
+if not ok then warn("[MC] Pack error: " .. tostring(err)) end
+
+
+---
+
+-- AUTO PATTERN: finds the game's other map patterns and swaps them too
+
+if AUTO_PATTERN then
+task.spawn(function()
+local cam = workspace.CurrentCamera
+
+local function detect()
+local counts, n = {}, 0
+for _, d in ipairs(workspace:GetDescendants()) do
+n = n + 1
+if n % 300 == 0 then task.wait() end
+if d.ClassName == "Texture" then
+local v = d.Texture
+if v ~= "" and not v:find("^rbxasset://") then
+local id = v:match("rbxassetid://(%d+)") or v:match("[?&]id=(%d+)")
+local part = d.Parent
+if id and resolved[id] == nil and part and part:IsA("BasePart")
+and part.Size.Magnitude > 6 and not excluded(d)
+and not (cam and d:IsDescendantOf(cam)) then
+counts[id] = (counts[id] or 0) + 1
+end
+end
+end
+end
+for id, c in pairs(counts) do
+if c >= AUTO_MIN_COUNT then
+resolved[id] = TILE
+log("auto pattern id " .. id .. " (x" .. c .. ")")
+end
+end
+n = 0
+for _, d in ipairs(workspace:GetDescendants()) do
+n = n + 1
+if n % 300 == 0 then task.wait() end
+if d.ClassName == "Texture" then trySwap(d, "Texture") end
+end
+end
+
+for _, t in ipairs({3, 7, 15, 25}) do    
+    task.wait(t)    
+    pcall(detect)    
+end
+
+end)
+
+end
+
+
+---
+
+-- FALLBACK: blocks on flat parts that are still bare
+
+if FALLBACK_PARTS then
+task.spawn(function()
+task.wait(3)
+local cam = workspace.CurrentCamera
+local seen = setmetatable({}, {__mode = "k"})
+
+local function skin(part)
+if fallbackParts >= MAX_PARTS or seen[part] then return end
+if not part:IsA("BasePart") or not plainEnough(part) then return end
+if part.Transparency >= 0.95 then return end
+local s = part.Size
+if math.max(s.X, s.Y, s.Z) < MIN_SIZE then return end
+if cam and part:IsDescendantOf(cam) then return end
+if excluded(part) then return end
+for _, p in ipairs(Players:GetPlayers()) do
+if p.Character and part:IsDescendantOf(p.Character) then return end
+end
+seen[part] = true
+
+local covered, foreign = {}, {}    
+    for _, c in ipairs(part:GetChildren()) do    
+        if c:IsA("Decal") and c.Texture == TILE and c.Transparency < 1 then    
+            covered[c.Face] = true    
+        elseif HIDE_OTHER_TEXTURES and c.ClassName == "Texture"    
+            and c.Name ~= "_McBlock" and c.Texture ~= "" and c.Transparency < 1 then    
+            foreign[#foreign + 1] = c    
+        end    
+    end    
+
+    local added = false    
+    for _, face in ipairs(Enum.NormalId:GetEnumItems()) do    
+        if not covered[face] then    
+            local a, b = faceSize(part, face)    
+            local skip = math.min(a, b) < MIN_FACE    
+                or (face == Enum.NormalId.Bottom and part.Position.Y < 5)    
+            if not skip then    
+                for _, f in ipairs(foreign) do    
+                    if f.Face == face then f.Transparency = 1 end    
+                end    
+                local u, v = fitScale(part, face)    
+                local t = Instance.new("Texture")    
+                t.Name = "_McBlock"    
+                t.Texture = TILE    
+                t.Face = face    
+                t.StudsPerTileU = u    
+                t.StudsPerTileV = v    
+                t.Color3 = TINT    
+                t.Parent = part    
+                added = true    
+            end    
+        end    
+    end    
+    if added then fallbackParts = fallbackParts + 1 end    
+end    
+
+local function scan()    
+    local n = 0    
+    for _, obj in ipairs(workspace:GetDescendants()) do    
+        skin(obj)    
+        n = n + 1    
+        if n % 100 == 0 then task.wait() end    
+    end    
+end    
+
+scan()    
+workspace.DescendantAdded:Connect(function(o)    
+    task.delay(3, skin, o)    
+end)    
+for _, t in ipairs({8, 20, 40}) do    
+    task.wait(t)    
+    scan()    
+end
+
+end)
+
+end
+
+task.wait(3)
+report()
+task.delay(30, report)
+log("done")
